@@ -19,9 +19,9 @@ from PIL import Image
 # ⚙️  CONFIG — change these to personalise the app
 # ─────────────────────────────────────────────────────────────
 
-BMC_USERNAME   = "t8tavern"          # buymeacoffee.com/<yourname>
+BMC_USERNAME   = "yourname"          # buymeacoffee.com/<yourname>
 KOFI_USERNAME  = "yourname"          # ko-fi.com/<yourname>
-CONTACT_EMAIL  = "tea8tavern@gmail.com"
+CONTACT_EMAIL  = "you@example.com"
 APP_TITLE      = "Passport Photo Pro"
 APP_TAGLINE    = "Free · Private · Instant passport & visa photos for 6+ countries"
 
@@ -44,27 +44,27 @@ class PhotoSpec:
 SPECS: dict[str, PhotoSpec] = {
     "🇮🇳  Indian Passport (Passport Seva)": PhotoSpec(
         "Indian Passport", "🇮🇳", 630, 810, 250*1024,
-        0.36, 0.30, "630×810 px · JPEG < 250 KB · White background",
+        0.72, 0.10, "630×810 px · JPEG < 250 KB · White background",
     ),
     "🇺🇸  US Passport / Visa": PhotoSpec(
         "US Passport", "🇺🇸", 600, 600, 240*1024,
-        0.50, 0.15, "600×600 px · JPEG < 240 KB · White/off-white background",
+        0.76, 0.08, "600×600 px · JPEG < 240 KB · White/off-white background",
     ),
     "🇬🇧  UK Passport": PhotoSpec(
         "UK Passport", "🇬🇧", 600, 750, 240*1024,
-        0.43, 0.20, "600×750 px · JPEG < 240 KB · Cream/white background",
+        0.73, 0.09, "600×750 px · JPEG < 240 KB · Cream/white background",
     ),
     "🇪🇺  EU / Schengen Visa": PhotoSpec(
         "EU / Schengen", "🇪🇺", 560, 700, 200*1024,
-        0.43, 0.20, "560×700 px · JPEG < 200 KB · White/light background",
+        0.73, 0.09, "560×700 px · JPEG < 200 KB · White/light background",
     ),
     "🇦🇺  Australian Passport": PhotoSpec(
         "Australian Passport", "🇦🇺", 472, 590, 200*1024,
-        0.40, 0.22, "472×590 px · JPEG < 200 KB · White background",
+        0.72, 0.10, "472×590 px · JPEG < 200 KB · White background",
     ),
     "🇨🇦  Canadian Passport": PhotoSpec(
         "Canadian Passport", "🇨🇦", 600, 750, 240*1024,
-        0.42, 0.22, "600×750 px · JPEG < 240 KB · White/light-grey background",
+        0.73, 0.09, "600×750 px · JPEG < 240 KB · White/light-grey background",
     ),
 }
 
@@ -325,7 +325,7 @@ div[data-testid="stDownloadButton"] > button:hover {
 /* ── Quality row ── */
 .q-grid {
     display: grid;
-    grid-template-columns: repeat(5, 1fr);
+    grid-template-columns: repeat(7, 1fr);
     gap: 0.5rem;
     margin: 0.6rem 0;
 }
@@ -390,19 +390,19 @@ def _clamp(v: float, lo: float, hi: float) -> float:
     return max(lo, min(v, hi))
 
 def _crop_around_face(img_w: int, img_h: int, f: FaceBox, spec: PhotoSpec) -> tuple[int,int,int,int]:
+    """Crop tightly so face fills face_ratio of output height — no loose padding."""
     aspect = spec.width_px / spec.height_px
-    ch = f.h / spec.face_ratio
+    ch = f.h / spec.face_ratio          # frame height from face_ratio directly
     cw = ch * aspect
-    ch = max(ch, f.h * 2.4)
-    cw = max(cw, f.w * 2.0)
     if cw / ch < aspect: cw = ch * aspect
-    else: ch = cw / aspect
-    cw, ch = min(cw, float(img_w)), min(ch, float(img_h))
+    else:                ch = cw / aspect
+    cw = min(cw, float(img_w)); ch = min(ch, float(img_h))
     if cw / ch < aspect: cw = ch * aspect
-    else: ch = cw / aspect
-    left = _clamp((f.x + f.w / 2) - cw / 2, 0, img_w - cw)
+    else:                ch = cw / aspect
+    cx   = f.x + f.w / 2
+    left = _clamp(cx - cw / 2, 0, img_w - cw)
     top  = _clamp(f.y - ch * spec.head_top_offset, 0, img_h - ch)
-    return int(round(left)), int(round(top)), int(round(left+cw)), int(round(top+ch))
+    return int(round(left)), int(round(top)), int(round(left + cw)), int(round(top + ch))
 
 def _center_crop(bgr: np.ndarray, aspect: float) -> np.ndarray:
     h, w = bgr.shape[:2]
@@ -444,6 +444,49 @@ def _whiten_bg(bgr: np.ndarray, face: Optional[FaceBox]) -> tuple[np.ndarray, bo
     white = np.full_like(bgr, 252)
     return (bgr.astype(np.float32) * a + white.astype(np.float32) * (1-a)).astype(np.uint8), True
 
+
+def _fix_lighting(bgr: np.ndarray) -> np.ndarray:
+    """CLAHE on L-channel + gentle highlight recovery for passport-ready brightness."""
+    lab = cv2.cvtColor(bgr, cv2.COLOR_BGR2LAB)
+    l, a, b = cv2.split(lab)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    l_eq = clahe.apply(l)
+    # Blend 65 % enhanced, 35 % original to avoid over-processing
+    l_blend = cv2.addWeighted(l_eq, 0.65, l, 0.35, 0)
+    # Soft gamma boost if image is dark (mean L < 110)
+    if float(np.mean(l_blend)) < 110:
+        lf = l_blend.astype(np.float32) / 255.0
+        l_blend = np.clip(np.power(lf, 0.80) * 255, 0, 255).astype(np.uint8)
+    merged = cv2.merge([l_blend, a, b])
+    return cv2.cvtColor(merged, cv2.COLOR_LAB2BGR)
+
+
+def _remove_red_eyes(bgr: np.ndarray, face: Optional[FaceBox]) -> np.ndarray:
+    """Desaturate red-channel hot-spots in the eye region of a detected face."""
+    if face is None:
+        return bgr
+    out = bgr.copy()
+    # Eye band: roughly 15–50 % down the face bounding box
+    ey1 = max(0,              face.y + int(face.h * 0.15))
+    ey2 = min(bgr.shape[0],  face.y + int(face.h * 0.52))
+    ex1 = max(0,              face.x + int(face.w * 0.05))
+    ex2 = min(bgr.shape[1],  face.x + int(face.w * 0.95))
+    if ey2 <= ey1 or ex2 <= ex1:
+        return out
+    roi = out[ey1:ey2, ex1:ex2].astype(np.float32)
+    b_ch, g_ch, r_ch = roi[:,:,0], roi[:,:,1], roi[:,:,2]
+    # Red-eye mask: red dominates and is bright enough
+    avg_other = (b_ch + g_ch) / 2.0
+    red_mask  = (r_ch > 100) & (r_ch > avg_other * 1.8)
+    if red_mask.any():
+        # Replace red channel with average of other two; dims green/blue slightly
+        grey = avg_other
+        roi[:,:,2][red_mask] = grey[red_mask] * 0.55   # tame red
+        roi[:,:,1][red_mask] = grey[red_mask] * 0.85   # slight green
+        roi[:,:,0][red_mask] = grey[red_mask] * 0.85   # slight blue
+        out[ey1:ey2, ex1:ex2] = np.clip(roi, 0, 255).astype(np.uint8)
+    return out
+
 def _quality_score(bgr: np.ndarray, face: Optional[FaceBox], n_faces: int) -> list[dict]:
     h, w = bgr.shape[:2]
     gray  = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
@@ -454,17 +497,33 @@ def _quality_score(bgr: np.ndarray, face: Optional[FaceBox], n_faces: int) -> li
         return {"label": label, "icon": icon, "ok": ok, "note": note,
                 "cls": "q-pass" if ok else "q-fail"}
 
+    # Red-eye heuristic: check eye band for red dominance
+    red_eye_ok = True
+    if face is not None:
+        ey1 = max(0, face.y + int(face.h * 0.15))
+        ey2 = min(h,  face.y + int(face.h * 0.52))
+        ex1 = max(0, face.x); ex2 = min(w, face.x + face.w)
+        if ey2 > ey1 and ex2 > ex1:
+            roi = bgr[ey1:ey2, ex1:ex2].astype(np.float32)
+            r_ch = roi[:,:,2]; avg_other = (roi[:,:,0]+roi[:,:,1])/2
+            red_pct = float(np.mean((r_ch > 100) & (r_ch > avg_other * 1.8)))
+            red_eye_ok = red_pct < 0.04
+
     items = [
         _q("Brightness", "☀️" if 80<=mean_b<=200 else ("🌑" if mean_b<80 else "💡"),
            80<=mean_b<=200, "Good" if 80<=mean_b<=200 else ("Too dark" if mean_b<80 else "Too bright")),
         _q("Sharpness", "🔍" if lap>100 else "🌫️",
            lap>100, "Sharp" if lap>100 else "Blurry"),
         _q("Face", "🧑" if n_faces==1 else ("❓" if n_faces==0 else "👥"),
-           n_faces==1, "Detected" if n_faces==1 else (f"None found" if n_faces==0 else f"{n_faces} faces")),
+           n_faces==1, "Detected" if n_faces==1 else ("None found" if n_faces==0 else f"{n_faces} faces")),
         _q("Face size", "✅" if (face and face.w*face.h/(w*h)>=0.05) else "⚠️",
            bool(face and face.w*face.h/(w*h)>=0.05), "Good" if (face and face.w*face.h/(w*h)>=0.05) else "Too small"),
         _q("Resolution", "📐" if (w>=MIN_DIM and h>=MIN_DIM) else "📉",
            w>=MIN_DIM and h>=MIN_DIM, "Good" if (w>=MIN_DIM and h>=MIN_DIM) else "Low res"),
+        _q("Red eyes", "👁️" if red_eye_ok else "🔴",
+           red_eye_ok, "None detected" if red_eye_ok else "Fixed automatically"),
+        _q("Lighting", "✨" if 80<=mean_b<=200 and lap>80 else "🔦",
+           80<=mean_b<=200 and lap>80, "Good" if 80<=mean_b<=200 and lap>80 else "Auto-enhanced"),
     ]
     return items
 
@@ -474,12 +533,24 @@ def _build_passport(img: Image.Image, spec: PhotoSpec):
     face = max(all_faces, key=lambda f: f.w*f.h) if all_faces else None
     quality = _quality_score(bgr, face, len(all_faces))
     aspect = spec.width_px / spec.height_px
+
+    # ── Step 1: red-eye removal (before crop so face coords are valid)
+    bgr = _remove_red_eyes(bgr, face)
+
+    # ── Step 2: tight face crop
     if face:
         l, t, r, b = _crop_around_face(bgr.shape[1], bgr.shape[0], face, spec)
         bgr = bgr[t:b, l:r]
     else:
         bgr = _center_crop(bgr, aspect)
+
+    # ── Step 3: lighting enhancement
+    bgr = _fix_lighting(bgr)
+
+    # ── Step 4: background whitening
     bgr, bg_ok = _whiten_bg(bgr, _largest_face(bgr))
+
+    # ── Step 5: final resize
     bgr = cv2.resize(bgr, (spec.width_px, spec.height_px), interpolation=cv2.INTER_CUBIC)
     return _bgr_to_pil(bgr), face is not None, bg_ok, quality
 
