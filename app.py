@@ -19,9 +19,9 @@ from PIL import Image
 # ⚙️  CONFIG — change these to personalise the app
 # ─────────────────────────────────────────────────────────────
 
-BMC_USERNAME   = "yourname"          # buymeacoffee.com/<yourname>
+BMC_USERNAME   = "https://buymeacoffee.com/t8tavern"          # buymeacoffee.com/<yourname>
 KOFI_USERNAME  = "yourname"          # ko-fi.com/<yourname>
-CONTACT_EMAIL  = "you@example.com"
+CONTACT_EMAIL  = "tea8tavern@gmail.com"
 APP_TITLE      = "Passport Photo Pro"
 APP_TAGLINE    = "Free · Private · Instant passport & visa photos for 6+ countries"
 
