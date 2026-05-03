@@ -44,27 +44,27 @@ class PhotoSpec:
 SPECS: dict[str, PhotoSpec] = {
     "🇮🇳  Indian Passport (Passport Seva)": PhotoSpec(
         "Indian Passport", "🇮🇳", 630, 810, 250*1024,
-        0.50, 0.12, "630×810 px · JPEG < 250 KB · White background",
+        0.28, 0.10, "630×810 px · JPEG < 250 KB · White background",
     ),
     "🇺🇸  US Passport / Visa": PhotoSpec(
         "US Passport", "🇺🇸", 600, 600, 240*1024,
-        0.52, 0.12, "600×600 px · JPEG < 240 KB · White/off-white background",
+        0.30, 0.10, "600×600 px · JPEG < 240 KB · White/off-white background",
     ),
     "🇬🇧  UK Passport": PhotoSpec(
         "UK Passport", "🇬🇧", 600, 750, 240*1024,
-        0.50, 0.12, "600×750 px · JPEG < 240 KB · Cream/white background",
+        0.28, 0.10, "600×750 px · JPEG < 240 KB · Cream/white background",
     ),
     "🇪🇺  EU / Schengen Visa": PhotoSpec(
         "EU / Schengen", "🇪🇺", 560, 700, 200*1024,
-        0.50, 0.12, "560×700 px · JPEG < 200 KB · White/light background",
+        0.28, 0.10, "560×700 px · JPEG < 200 KB · White/light background",
     ),
     "🇦🇺  Australian Passport": PhotoSpec(
         "Australian Passport", "🇦🇺", 472, 590, 200*1024,
-        0.50, 0.12, "472×590 px · JPEG < 200 KB · White background",
+        0.28, 0.10, "472×590 px · JPEG < 200 KB · White background",
     ),
     "🇨🇦  Canadian Passport": PhotoSpec(
         "Canadian Passport", "🇨🇦", 600, 750, 240*1024,
-        0.50, 0.12, "600×750 px · JPEG < 240 KB · White/light-grey background",
+        0.28, 0.10, "600×750 px · JPEG < 240 KB · White/light-grey background",
     ),
 }
 
