@@ -44,27 +44,27 @@ class PhotoSpec:
 SPECS: dict[str, PhotoSpec] = {
     "🇮🇳  Indian Passport (Passport Seva)": PhotoSpec(
         "Indian Passport", "🇮🇳", 630, 810, 250*1024,
-        0.72, 0.10, "630×810 px · JPEG < 250 KB · White background",
+        0.50, 0.12, "630×810 px · JPEG < 250 KB · White background",
     ),
     "🇺🇸  US Passport / Visa": PhotoSpec(
         "US Passport", "🇺🇸", 600, 600, 240*1024,
-        0.76, 0.08, "600×600 px · JPEG < 240 KB · White/off-white background",
+        0.52, 0.12, "600×600 px · JPEG < 240 KB · White/off-white background",
     ),
     "🇬🇧  UK Passport": PhotoSpec(
         "UK Passport", "🇬🇧", 600, 750, 240*1024,
-        0.73, 0.09, "600×750 px · JPEG < 240 KB · Cream/white background",
+        0.50, 0.12, "600×750 px · JPEG < 240 KB · Cream/white background",
     ),
     "🇪🇺  EU / Schengen Visa": PhotoSpec(
         "EU / Schengen", "🇪🇺", 560, 700, 200*1024,
-        0.73, 0.09, "560×700 px · JPEG < 200 KB · White/light background",
+        0.50, 0.12, "560×700 px · JPEG < 200 KB · White/light background",
     ),
     "🇦🇺  Australian Passport": PhotoSpec(
         "Australian Passport", "🇦🇺", 472, 590, 200*1024,
-        0.72, 0.10, "472×590 px · JPEG < 200 KB · White background",
+        0.50, 0.12, "472×590 px · JPEG < 200 KB · White background",
     ),
     "🇨🇦  Canadian Passport": PhotoSpec(
         "Canadian Passport", "🇨🇦", 600, 750, 240*1024,
-        0.73, 0.09, "600×750 px · JPEG < 240 KB · White/light-grey background",
+        0.50, 0.12, "600×750 px · JPEG < 240 KB · White/light-grey background",
     ),
 }
 
@@ -436,29 +436,33 @@ def _largest_face(bgr: np.ndarray) -> Optional[FaceBox]:
 
 def _crop_around_face(img_w: int, img_h: int, f: FaceBox, spec: PhotoSpec) -> tuple[int,int,int,int]:
     """
-    Place the face so it occupies spec.face_ratio of the output height,
-    with spec.head_top_offset headroom above the top of the detection box.
-    The Haar face box covers forehead→chin, so face_ratio ~0.70 makes the
-    head fill ~70 % of the frame — correct for most passport standards.
+    Crop so the face (Haar box = forehead→chin) occupies face_ratio of crop height,
+    with head_top_offset gap above it. Remaining space below goes to neck + shoulders.
+
+    Example with face_ratio=0.50, head_top_offset=0.12, crop_h=H:
+      • gap above hairline  = 0.12 * H
+      • face box            = 0.50 * H   ← forehead to chin
+      • neck + shoulders    = 0.38 * H   (everything below)
+    This matches the classic passport-photo framing.
     """
     aspect = spec.width_px / spec.height_px
 
-    # Derive crop height so that f.h / crop_h == face_ratio
+    # Total crop height derived from face height and desired face_ratio
     ch = float(f.h) / spec.face_ratio
     cw = ch * aspect
 
-    # Clamp to image bounds while preserving aspect ratio
-    if cw > img_w:
-        cw = float(img_w); ch = cw / aspect
-    if ch > img_h:
-        ch = float(img_h); cw = ch * aspect
+    # Enforce aspect ratio after clamping
+    if cw > img_w: cw = float(img_w); ch = cw / aspect
+    if ch > img_h: ch = float(img_h); cw = ch * aspect
 
-    # Horizontal: centre on face midpoint
+    # Horizontal: centre crop on face midpoint
     cx   = f.x + f.w / 2.0
     left = _clamp(cx - cw / 2.0, 0.0, img_w - cw)
 
-    # Vertical: head_top_offset fraction of ch above detection box top
-    top  = _clamp(f.y - ch * spec.head_top_offset, 0.0, img_h - ch)
+    # Vertical: place top of crop so there is head_top_offset*ch space
+    # above the TOP of the Haar detection box (i.e. above the forehead)
+    face_top = float(f.y)
+    top = _clamp(face_top - ch * spec.head_top_offset, 0.0, img_h - ch)
 
     return int(round(left)), int(round(top)), int(round(left + cw)), int(round(top + ch))
 
