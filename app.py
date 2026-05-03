@@ -354,7 +354,7 @@ div[data-testid="stDownloadButton"] > button:hover {
 """
 
 # ─────────────────────────────────────────────────────────────
-# 🖼️  Image processing (unchanged core logic)
+# 🖼️  Image processing — robust OpenCV pipeline (no GrabCut)
 # ─────────────────────────────────────────────────────────────
 
 @dataclass(frozen=True)
@@ -367,41 +367,99 @@ def _pil_to_bgr(img: Image.Image) -> np.ndarray:
 def _bgr_to_pil(arr: np.ndarray) -> Image.Image:
     return Image.fromarray(cv2.cvtColor(arr, cv2.COLOR_BGR2RGB))
 
+def _clamp(v: float, lo: float, hi: float) -> float:
+    return max(lo, min(v, hi))
+
+# ── Face detection ──────────────────────────────────────────
+
 @st.cache_resource(show_spinner=False)
-def _cascade():
-    return cv2.CascadeClassifier(
+def _cascades():
+    """Load face + eye cascades once and keep in memory."""
+    face_cc = cv2.CascadeClassifier(
         cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
     )
+    # alt cascade catches faces the default misses
+    face_alt = cv2.CascadeClassifier(
+        cv2.data.haarcascades + "haarcascade_frontalface_alt2.xml"
+    )
+    eye_cc = cv2.CascadeClassifier(
+        cv2.data.haarcascades + "haarcascade_eye_tree_eyeglasses.xml"
+    )
+    return face_cc, face_alt, eye_cc
 
 def _detect_faces(bgr: np.ndarray) -> list[FaceBox]:
+    """Multi-scale Haar cascade with two classifiers and histogram equalisation."""
+    face_cc, face_alt, _ = _cascades()
+    h, w = bgr.shape[:2]
+    min_dim = max(40, min(w, h) // 8)
+
     gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
-    rects = _cascade().detectMultiScale(
-        gray, scaleFactor=1.1, minNeighbors=5, minSize=(60, 60)
-    )
-    if len(rects) == 0:
+    gray_eq = cv2.equalizeHist(gray)            # boost contrast for dark/flat images
+
+    boxes: list[FaceBox] = []
+    for cc in (face_cc, face_alt):
+        for g in (gray_eq, gray):               # try enhanced first, raw as fallback
+            rects = cc.detectMultiScale(
+                g,
+                scaleFactor=1.05,               # finer scale steps than default 1.1
+                minNeighbors=4,
+                minSize=(min_dim, min_dim),
+                flags=cv2.CASCADE_SCALE_IMAGE,
+            )
+            if len(rects) > 0:
+                boxes += [FaceBox(int(x), int(y), int(ww), int(hh))
+                          for x, y, ww, hh in rects]
+                break                           # no need to try raw if enhanced worked
+
+    if not boxes:
         return []
-    return [FaceBox(int(x), int(y), int(w), int(h)) for x, y, w, h in rects]
+
+    # Non-maximum suppression: merge heavily overlapping boxes
+    def _iou(a: FaceBox, b: FaceBox) -> float:
+        ix1, iy1 = max(a.x, b.x), max(a.y, b.y)
+        ix2, iy2 = min(a.x+a.w, b.x+b.w), min(a.y+a.h, b.y+b.h)
+        inter = max(0, ix2-ix1) * max(0, iy2-iy1)
+        union = a.w*a.h + b.w*b.h - inter
+        return inter / union if union > 0 else 0.0
+
+    kept: list[FaceBox] = []
+    for fb in sorted(boxes, key=lambda f: f.w*f.h, reverse=True):
+        if all(_iou(fb, k) < 0.4 for k in kept):
+            kept.append(fb)
+    return kept
 
 def _largest_face(bgr: np.ndarray) -> Optional[FaceBox]:
     faces = _detect_faces(bgr)
     return max(faces, key=lambda f: f.w * f.h) if faces else None
 
-def _clamp(v: float, lo: float, hi: float) -> float:
-    return max(lo, min(v, hi))
+# ── Crop ────────────────────────────────────────────────────
 
 def _crop_around_face(img_w: int, img_h: int, f: FaceBox, spec: PhotoSpec) -> tuple[int,int,int,int]:
-    """Crop tightly so face fills face_ratio of output height — no loose padding."""
+    """
+    Place the face so it occupies spec.face_ratio of the output height,
+    with spec.head_top_offset headroom above the top of the detection box.
+    The Haar face box covers forehead→chin, so face_ratio ~0.70 makes the
+    head fill ~70 % of the frame — correct for most passport standards.
+    """
     aspect = spec.width_px / spec.height_px
-    ch = f.h / spec.face_ratio          # frame height from face_ratio directly
+
+    # Derive crop height so that f.h / crop_h == face_ratio
+    ch = float(f.h) / spec.face_ratio
     cw = ch * aspect
-    if cw / ch < aspect: cw = ch * aspect
-    else:                ch = cw / aspect
-    cw = min(cw, float(img_w)); ch = min(ch, float(img_h))
-    if cw / ch < aspect: cw = ch * aspect
-    else:                ch = cw / aspect
-    cx   = f.x + f.w / 2
-    left = _clamp(cx - cw / 2, 0, img_w - cw)
-    top  = _clamp(f.y - ch * spec.head_top_offset, 0, img_h - ch)
+
+    # Clamp to image bounds while preserving aspect ratio
+    if cw > img_w:
+        cw = float(img_w); ch = cw / aspect
+    if ch > img_h:
+        ch = float(img_h); cw = ch * aspect
+
+    # Horizontal: centre on face midpoint
+    cx   = f.x + f.w / 2.0
+    left = _clamp(cx - cw / 2.0, 0.0, img_w - cw)
+
+    # Vertical: head_top_offset fraction of ch above detection box top
+    top  = _clamp(f.y - ch * spec.head_top_offset, 0.0, img_h - ch)
+
     return int(round(left)), int(round(top)), int(round(left + cw)), int(round(top + ch))
 
 def _center_crop(bgr: np.ndarray, aspect: float) -> np.ndarray:
@@ -412,84 +470,220 @@ def _center_crop(bgr: np.ndarray, aspect: float) -> np.ndarray:
     nh = int(w / aspect); s = (h - nh) // 2
     return bgr[s:s + nh, :]
 
-def _whiten_bg(bgr: np.ndarray, face: Optional[FaceBox]) -> tuple[np.ndarray, bool]:
-    h, w = bgr.shape[:2]
-    mask   = np.full((h, w), cv2.GC_PR_BGD, np.uint8)
-    bg_mdl = np.zeros((1, 65), np.float64)
-    fg_mdl = np.zeros((1, 65), np.float64)
-    bx, by = max(8, int(w*.03)), max(8, int(h*.03))
-    mask[:by, :] = mask[-by:, :] = cv2.GC_BGD
-    mask[:, :bx] = mask[:, -bx:] = cv2.GC_BGD
-    mx, my = max(20, int(w*.18)), max(20, int(h*.12))
-    mask[my:h-my, mx:w-mx] = cv2.GC_PR_FGD
-    if face is not None:
-        fl = int(_clamp(face.x - face.w*.9, 0, w-1))
-        ft = int(_clamp(face.y - face.h*1.2, 0, h-1))
-        fr = int(_clamp(face.x + face.w*1.9, 1, w))
-        fb = int(_clamp(face.y + face.h*3.2, 1, h))
-        if fr > fl and fb > ft:
-            mask[ft:fb, fl:fr] = cv2.GC_FGD
-    try:
-        cv2.grabCut(bgr, mask, None, bg_mdl, fg_mdl, 5, cv2.GC_INIT_WITH_MASK)
-        fg = np.where((mask == cv2.GC_FGD) | (mask == cv2.GC_PR_FGD), 255, 0).astype(np.uint8)
-    except cv2.error:
-        fg = np.full((h, w), 255, np.uint8)
-    k = np.ones((5, 5), np.uint8)
-    fg = cv2.morphologyEx(fg, cv2.MORPH_CLOSE, k)
-    fg = cv2.dilate(fg, k)
-    fg = cv2.GaussianBlur(fg, (7, 7), 0)
-    if np.count_nonzero(fg) / (h * w) < 0.18:
-        return bgr, False
-    a = (fg.astype(np.float32) / 255.0)[..., None]
-    white = np.full_like(bgr, 252)
-    return (bgr.astype(np.float32) * a + white.astype(np.float32) * (1-a)).astype(np.uint8), True
+# ── Background replacement (flood-fill, NO GrabCut) ─────────
 
+def _sample_bg_color(bgr: np.ndarray, corner_frac: float = 0.04) -> np.ndarray:
+    """Sample median color from the four image corners — that is the background."""
+    h, w = bgr.shape[:2]
+    cs = max(4, int(min(h, w) * corner_frac))
+    patches = [
+        bgr[:cs, :cs],
+        bgr[:cs, w-cs:],
+        bgr[h-cs:, :cs],
+        bgr[h-cs:, w-cs:],
+    ]
+    pixels = np.vstack([p.reshape(-1, 3) for p in patches])
+    return np.median(pixels, axis=0).astype(np.uint8)   # shape (3,)
+
+def _flood_fill_bg_mask(bgr: np.ndarray, seed_color: np.ndarray,
+                        tolerance: int = 28) -> np.ndarray:
+    """
+    Flood-fill outward from all four corners using seed_color ± tolerance.
+    Returns uint8 mask: 255 = background, 0 = foreground.
+    Pure colour-distance flood — never touches the face region.
+    """
+    h, w = bgr.shape[:2]
+    # Work in float32 for stable distance comparisons
+    img_f   = bgr.astype(np.float32)
+    seed_f  = seed_color.astype(np.float32)
+    tol_sq  = float(tolerance ** 2)
+
+    # Pre-compute per-pixel squared L2 distance to seed color
+    dist_sq = np.sum((img_f - seed_f) ** 2, axis=2)   # shape (h, w)
+
+    # Start mask: corners seed pixels
+    visited = np.zeros((h, w), dtype=bool)
+    bg_mask = np.zeros((h, w), dtype=bool)
+
+    corner_size = max(3, int(min(h, w) * 0.03))
+    seeds: list[tuple[int,int]] = []
+    for ry in [range(corner_size), range(h-corner_size, h)]:
+        for rx in [range(corner_size), range(w-corner_size, w)]:
+            for y in ry:
+                for x in rx:
+                    if not visited[y, x]:
+                        visited[y, x] = True
+                        seeds.append((y, x))
+
+    # BFS flood fill
+    from collections import deque
+    queue = deque()
+    for y, x in seeds:
+        if dist_sq[y, x] <= tol_sq:
+            bg_mask[y, x] = True
+            queue.append((y, x))
+
+    dy = (-1, 1,  0, 0)
+    dx = ( 0, 0, -1, 1)
+    while queue:
+        cy, cx = queue.popleft()
+        for i in range(4):
+            ny, nx = cy + dy[i], cx + dx[i]
+            if 0 <= ny < h and 0 <= nx < w and not visited[ny, nx]:
+                visited[ny, nx] = True
+                if dist_sq[ny, nx] <= tol_sq:
+                    bg_mask[ny, nx] = True
+                    queue.append((ny, nx))
+
+    return (bg_mask.astype(np.uint8) * 255)
+
+def _refine_mask(raw_mask: np.ndarray, h: int, w: int,
+                 face: Optional[FaceBox]) -> np.ndarray:
+    """
+    Morphologically clean the flood-fill result, then create a soft
+    alpha channel for natural compositing. Face region is hard-protected.
+    """
+    k3 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    k7 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+    k15 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
+
+    # Fill small gaps that flood-fill missed
+    fg_mask = cv2.bitwise_not(raw_mask)              # foreground = 255
+    fg_mask = cv2.morphologyEx(fg_mask, cv2.MORPH_CLOSE,  k15)  # close holes
+    fg_mask = cv2.morphologyEx(fg_mask, cv2.MORPH_OPEN,   k3)   # remove noise
+    fg_mask = cv2.dilate(fg_mask, k7, iterations=1)              # recover any over-eroded edges
+
+    # Hard-protect face region — never let it become background
+    if face is not None:
+        pad = int(face.w * 0.15)
+        fx1 = max(0, face.x - pad);    fx2 = min(w, face.x + face.w + pad)
+        fy1 = max(0, face.y - pad);    fy2 = min(h, face.y + face.h + pad)
+        fg_mask[fy1:fy2, fx1:fx2] = 255
+
+    # Soft feathered alpha for smooth edges (avoids hard aliased lines)
+    alpha = cv2.GaussianBlur(fg_mask, (21, 21), 0)
+    return alpha          # uint8 0-255 soft alpha
+
+def _replace_background(bgr: np.ndarray,
+                         face: Optional[FaceBox]) -> tuple[np.ndarray, bool]:
+    """
+    Replace background with white (252,252,252) using flood-fill + soft compositing.
+    No GrabCut — no black patches.
+    """
+    h, w = bgr.shape[:2]
+
+    seed_color = _sample_bg_color(bgr)
+    raw_mask   = _flood_fill_bg_mask(bgr, seed_color, tolerance=30)
+    alpha      = _refine_mask(raw_mask, h, w, face)
+
+    fg_coverage = float(np.count_nonzero(alpha > 127)) / (h * w)
+    if fg_coverage < 0.10:
+        # Mask looks wrong (almost nothing foreground) — return original untouched
+        return bgr, False
+
+    a   = alpha.astype(np.float32)[:, :, None] / 255.0
+    white = np.full_like(bgr, 252, dtype=np.float32)
+    result = (bgr.astype(np.float32) * a + white * (1.0 - a))
+    return np.clip(result, 0, 255).astype(np.uint8), True
+
+# ── Lighting enhancement ────────────────────────────────────
 
 def _fix_lighting(bgr: np.ndarray) -> np.ndarray:
-    """CLAHE on L-channel + gentle highlight recovery for passport-ready brightness."""
+    """
+    Gentle CLAHE in LAB L-channel + optional gamma lift for dark images.
+    clipLimit=1.5 keeps it subtle — no halos or over-sharpening.
+    """
     lab = cv2.cvtColor(bgr, cv2.COLOR_BGR2LAB)
     l, a, b = cv2.split(lab)
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-    l_eq = clahe.apply(l)
-    # Blend 65 % enhanced, 35 % original to avoid over-processing
-    l_blend = cv2.addWeighted(l_eq, 0.65, l, 0.35, 0)
-    # Soft gamma boost if image is dark (mean L < 110)
-    if float(np.mean(l_blend)) < 110:
-        lf = l_blend.astype(np.float32) / 255.0
-        l_blend = np.clip(np.power(lf, 0.80) * 255, 0, 255).astype(np.uint8)
+
+    clahe = cv2.createCLAHE(clipLimit=1.5, tileGridSize=(8, 8))
+    l_eq  = clahe.apply(l)
+
+    # Blend: 55 % enhanced + 45 % original to stay natural
+    l_blend = cv2.addWeighted(l_eq, 0.55, l, 0.45, 0)
+
+    mean_l = float(np.mean(l_blend))
+
+    # Gentle gamma lift only if noticeably dark
+    if mean_l < 105:
+        gamma  = 0.82                          # < 1 brightens
+        lut    = np.array([
+            min(255, int((i / 255.0) ** gamma * 255))
+            for i in range(256)
+        ], dtype=np.uint8)
+        l_blend = cv2.LUT(l_blend, lut)
+
+    # Slight highlight recovery for over-exposed images
+    elif mean_l > 210:
+        lut = np.array([
+            min(255, int((i / 255.0) ** 1.10 * 255))
+            for i in range(256)
+        ], dtype=np.uint8)
+        l_blend = cv2.LUT(l_blend, lut)
+
     merged = cv2.merge([l_blend, a, b])
     return cv2.cvtColor(merged, cv2.COLOR_LAB2BGR)
 
+# ── Red-eye removal ─────────────────────────────────────────
 
 def _remove_red_eyes(bgr: np.ndarray, face: Optional[FaceBox]) -> np.ndarray:
-    """Desaturate red-channel hot-spots in the eye region of a detected face."""
+    """
+    Two-stage red-eye fix:
+    1. Use the eye cascade to find exact eye locations (precise).
+    2. Fall back to heuristic eye-band scan if cascade finds nothing.
+    Only modifies pixels where red channel dominates substantially.
+    """
     if face is None:
         return bgr
+
+    _, _, eye_cc = _cascades()
     out = bgr.copy()
-    # Eye band: roughly 15–50 % down the face bounding box
-    ey1 = max(0,              face.y + int(face.h * 0.15))
-    ey2 = min(bgr.shape[0],  face.y + int(face.h * 0.52))
-    ex1 = max(0,              face.x + int(face.w * 0.05))
-    ex2 = min(bgr.shape[1],  face.x + int(face.w * 0.95))
-    if ey2 <= ey1 or ex2 <= ex1:
-        return out
-    roi = out[ey1:ey2, ex1:ex2].astype(np.float32)
-    b_ch, g_ch, r_ch = roi[:,:,0], roi[:,:,1], roi[:,:,2]
-    # Red-eye mask: red dominates and is bright enough
-    avg_other = (b_ch + g_ch) / 2.0
-    red_mask  = (r_ch > 100) & (r_ch > avg_other * 1.8)
-    if red_mask.any():
-        # Replace red channel with average of other two; dims green/blue slightly
-        grey = avg_other
-        roi[:,:,2][red_mask] = grey[red_mask] * 0.55   # tame red
-        roi[:,:,1][red_mask] = grey[red_mask] * 0.85   # slight green
-        roi[:,:,0][red_mask] = grey[red_mask] * 0.85   # slight blue
-        out[ey1:ey2, ex1:ex2] = np.clip(roi, 0, 255).astype(np.uint8)
+    h_img, w_img = bgr.shape[:2]
+
+    # Restrict search to upper half of face box
+    ey1 = max(0, face.y + int(face.h * 0.10))
+    ey2 = max(ey1 + 1, min(h_img, face.y + int(face.h * 0.60)))
+    ex1 = max(0, face.x)
+    ex2 = min(w_img, face.x + face.w)
+
+    face_roi_gray = cv2.cvtColor(out[ey1:ey2, ex1:ex2], cv2.COLOR_BGR2GRAY)
+    eye_rects = eye_cc.detectMultiScale(
+        face_roi_gray, scaleFactor=1.1, minNeighbors=3,
+        minSize=(max(8, face.w//8), max(8, face.h//8)),
+    )
+
+    def _fix_roi(roi_bgr: np.ndarray) -> np.ndarray:
+        """Desaturate red-dominant pixels in a small eye ROI."""
+        roi = roi_bgr.astype(np.float32)
+        b_c, g_c, r_c = roi[:,:,0], roi[:,:,1], roi[:,:,2]
+        avg_bg  = (b_c + g_c) / 2.0
+        # Strict mask: red > 120, red > 2× average of other channels
+        mask    = (r_c > 120) & (r_c > avg_bg * 2.0)
+        if mask.any():
+            # Replace with luminance-preserving grey (natural dark pupil)
+            grey          = np.clip(avg_bg * 0.50, 0, 255)
+            roi[:,:,2][mask] = grey[mask]          # red  → dark
+            roi[:,:,1][mask] = grey[mask] * 0.95   # green → slightly dark
+            roi[:,:,0][mask] = grey[mask] * 0.95   # blue  → slightly dark
+        return np.clip(roi, 0, 255).astype(np.uint8)
+
+    if len(eye_rects) > 0:
+        # Cascade found eyes — fix each one precisely
+        for (ex, ey, ew, eh) in eye_rects:
+            abs_x1 = ex1 + ex;  abs_x2 = abs_x1 + ew
+            abs_y1 = ey1 + ey;  abs_y2 = abs_y1 + eh
+            out[abs_y1:abs_y2, abs_x1:abs_x2] =                 _fix_roi(out[abs_y1:abs_y2, abs_x1:abs_x2])
+    else:
+        # Fallback: fix the entire heuristic eye band
+        out[ey1:ey2, ex1:ex2] = _fix_roi(out[ey1:ey2, ex1:ex2])
+
     return out
+
+# ── Quality scoring ─────────────────────────────────────────
 
 def _quality_score(bgr: np.ndarray, face: Optional[FaceBox], n_faces: int) -> list[dict]:
     h, w = bgr.shape[:2]
-    gray  = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+    gray   = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
     mean_b = float(np.mean(gray))
     lap    = cv2.Laplacian(gray, cv2.CV_64F).var()
 
@@ -497,61 +691,84 @@ def _quality_score(bgr: np.ndarray, face: Optional[FaceBox], n_faces: int) -> li
         return {"label": label, "icon": icon, "ok": ok, "note": note,
                 "cls": "q-pass" if ok else "q-fail"}
 
-    # Red-eye heuristic: check eye band for red dominance
-    red_eye_ok = True
+    # Red-eye pre-check (before correction)
+    red_eye_detected = False
     if face is not None:
-        ey1 = max(0, face.y + int(face.h * 0.15))
-        ey2 = min(h,  face.y + int(face.h * 0.52))
+        ey1 = max(0, face.y + int(face.h * 0.10))
+        ey2 = min(h, face.y + int(face.h * 0.60))
         ex1 = max(0, face.x); ex2 = min(w, face.x + face.w)
         if ey2 > ey1 and ex2 > ex1:
-            roi = bgr[ey1:ey2, ex1:ex2].astype(np.float32)
-            r_ch = roi[:,:,2]; avg_other = (roi[:,:,0]+roi[:,:,1])/2
-            red_pct = float(np.mean((r_ch > 100) & (r_ch > avg_other * 1.8)))
-            red_eye_ok = red_pct < 0.04
+            roi  = bgr[ey1:ey2, ex1:ex2].astype(np.float32)
+            r_c  = roi[:,:,2]
+            avg  = (roi[:,:,0] + roi[:,:,1]) / 2.0
+            pct  = float(np.mean((r_c > 120) & (r_c > avg * 2.0)))
+            red_eye_detected = pct > 0.02
+
+    bright_ok = 80 <= mean_b <= 210
+    sharp_ok  = lap > 80
 
     items = [
-        _q("Brightness", "☀️" if 80<=mean_b<=200 else ("🌑" if mean_b<80 else "💡"),
-           80<=mean_b<=200, "Good" if 80<=mean_b<=200 else ("Too dark" if mean_b<80 else "Too bright")),
-        _q("Sharpness", "🔍" if lap>100 else "🌫️",
-           lap>100, "Sharp" if lap>100 else "Blurry"),
-        _q("Face", "🧑" if n_faces==1 else ("❓" if n_faces==0 else "👥"),
-           n_faces==1, "Detected" if n_faces==1 else ("None found" if n_faces==0 else f"{n_faces} faces")),
-        _q("Face size", "✅" if (face and face.w*face.h/(w*h)>=0.05) else "⚠️",
-           bool(face and face.w*face.h/(w*h)>=0.05), "Good" if (face and face.w*face.h/(w*h)>=0.05) else "Too small"),
-        _q("Resolution", "📐" if (w>=MIN_DIM and h>=MIN_DIM) else "📉",
-           w>=MIN_DIM and h>=MIN_DIM, "Good" if (w>=MIN_DIM and h>=MIN_DIM) else "Low res"),
-        _q("Red eyes", "👁️" if red_eye_ok else "🔴",
-           red_eye_ok, "None detected" if red_eye_ok else "Fixed automatically"),
-        _q("Lighting", "✨" if 80<=mean_b<=200 and lap>80 else "🔦",
-           80<=mean_b<=200 and lap>80, "Good" if 80<=mean_b<=200 and lap>80 else "Auto-enhanced"),
+        _q("Brightness",
+           "☀️" if bright_ok else ("🌑" if mean_b < 80 else "💡"),
+           bright_ok,
+           "Good" if bright_ok else ("Too dark" if mean_b < 80 else "Too bright")),
+        _q("Sharpness",
+           "🔍" if sharp_ok else "🌫️",
+           sharp_ok,
+           "Sharp" if sharp_ok else "Blurry"),
+        _q("Face",
+           "🧑" if n_faces == 1 else ("❓" if n_faces == 0 else "👥"),
+           n_faces == 1,
+           "Detected" if n_faces == 1 else ("None found" if n_faces == 0 else f"{n_faces} faces")),
+        _q("Face size",
+           "✅" if (face and face.w * face.h / (w * h) >= 0.04) else "⚠️",
+           bool(face and face.w * face.h / (w * h) >= 0.04),
+           "Good" if (face and face.w * face.h / (w * h) >= 0.04) else "Too small"),
+        _q("Resolution",
+           "📐" if (w >= MIN_DIM and h >= MIN_DIM) else "📉",
+           w >= MIN_DIM and h >= MIN_DIM,
+           "Good" if (w >= MIN_DIM and h >= MIN_DIM) else "Low res"),
+        _q("Red eyes",
+           "🔴" if red_eye_detected else "👁️",
+           not red_eye_detected,
+           "Fixed ✓" if red_eye_detected else "None"),
+        _q("Lighting",
+           "✨" if bright_ok and sharp_ok else "🔦",
+           bright_ok and sharp_ok,
+           "Good" if bright_ok and sharp_ok else "Auto-enhanced"),
     ]
     return items
 
-def _build_passport(img: Image.Image, spec: PhotoSpec):
-    bgr = _pil_to_bgr(img)
-    all_faces = _detect_faces(bgr)
-    face = max(all_faces, key=lambda f: f.w*f.h) if all_faces else None
-    quality = _quality_score(bgr, face, len(all_faces))
-    aspect = spec.width_px / spec.height_px
+# ── Master pipeline ─────────────────────────────────────────
 
-    # ── Step 1: red-eye removal (before crop so face coords are valid)
+def _build_passport(img: Image.Image, spec: PhotoSpec):
+    bgr       = _pil_to_bgr(img)
+    all_faces = _detect_faces(bgr)
+    face      = max(all_faces, key=lambda f: f.w * f.h) if all_faces else None
+    quality   = _quality_score(bgr, face, len(all_faces))
+    aspect    = spec.width_px / spec.height_px
+
+    # 1 ── Red-eye removal (use original face coords before crop)
     bgr = _remove_red_eyes(bgr, face)
 
-    # ── Step 2: tight face crop
+    # 2 ── Tight face-centred crop (or centre crop if no face)
     if face:
         l, t, r, b = _crop_around_face(bgr.shape[1], bgr.shape[0], face, spec)
         bgr = bgr[t:b, l:r]
     else:
         bgr = _center_crop(bgr, aspect)
 
-    # ── Step 3: lighting enhancement
+    # 3 ── Lighting enhancement (CLAHE + optional gamma)
     bgr = _fix_lighting(bgr)
 
-    # ── Step 4: background whitening
-    bgr, bg_ok = _whiten_bg(bgr, _largest_face(bgr))
+    # 4 ── Background replacement (flood-fill, NO GrabCut)
+    face_after_crop = _largest_face(bgr)          # re-detect in cropped frame
+    bgr, bg_ok = _replace_background(bgr, face_after_crop)
 
-    # ── Step 5: final resize
-    bgr = cv2.resize(bgr, (spec.width_px, spec.height_px), interpolation=cv2.INTER_CUBIC)
+    # 5 ── Final resize to exact spec dimensions
+    bgr = cv2.resize(bgr, (spec.width_px, spec.height_px),
+                     interpolation=cv2.INTER_LANCZOS4)
+
     return _bgr_to_pil(bgr), face is not None, bg_ok, quality
 
 def _encode_jpeg(img: Image.Image, limit: int) -> tuple[bytes, int]:
